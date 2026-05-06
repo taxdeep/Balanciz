@@ -47,6 +47,8 @@ templ bodyPayBills(vm PayBillsVM) {
 						type="date"
 						name="entry_date"
 						value={ vm.EntryDate }
+						@input.debounce.300ms="onPaymentDateChange()"
+						@change="onPaymentDateChange()"
 						class={ "mt-1 block w-full rounded-md border bg-surface px-2.5 py-1.5 text-body text-text outline-none focus:ring-2 focus:ring-primary-focus [color-scheme:dark] " + fieldBorderClass(vm.DateError != "") }
 					/>
 					if vm.DateError != "" {
@@ -113,7 +115,8 @@ templ bodyPayBills(vm PayBillsVM) {
 							<span class="ml-1 font-normal text-text-muted2" x-text="exchangeRateLabel()"></span>
 						</p>
 						<p class="mt-0.5 text-small text-text-muted2">
-							Bills are in a foreign currency. Enter a rate or leave blank to use the system rate table.
+							Bills are in a foreign currency. The system will auto-fill a rate when available; you can override it here.
+							<span x-show="exchangeRateHint" x-cloak class="ml-1" x-text="exchangeRateHint"></span>
 						</p>
 					</div>
 					<div class="w-44">
@@ -121,8 +124,10 @@ templ bodyPayBills(vm PayBillsVM) {
 							type="text"
 							name="exchange_rate"
 							value={ vm.ExchangeRate }
+							x-model="exchangeRate"
+							@input="onExchangeRateInput()"
 							inputmode="decimal"
-							placeholder="e.g. 0.73"
+							placeholder="auto-lookup"
 							autocomplete="off"
 							class={ "block w-full rounded-md border px-2.5 py-1.5 text-body outline-none focus:ring-2 focus:ring-primary-focus " + fieldBorderClass(vm.ExchangeRateError != "") }
 						/>
@@ -338,9 +343,22 @@ templ bodyPayBills(vm PayBillsVM) {
 					accountCurrencies: accountCurrencies || {},
 					baseCurrency: baseCurrency || 'CAD',
 					selectedBankID: '',
+					exchangeRate: '',
+					exchangeRateHint: '',
+					exchangeRateManual: false,
+					exchangeRateFetchSeq: 0,
 					totalBillCount: bills.length,
 					pageSize: 20,
 					currentPage: 1,
+
+					init: function() {
+						var rateField = this._exchangeRateField();
+						if (rateField) {
+							this.exchangeRate = String(rateField.value || '').trim();
+							this.exchangeRateManual = this.exchangeRate !== '';
+						}
+						this.lookupExchangeRate({ force: false });
+					},
 
 					// ── Selection ──────────────────────────────────────────────────
 					toggleAll: function(checked) {
@@ -350,15 +368,18 @@ templ bodyPayBills(vm PayBillsVM) {
 							if (checked) { self.rows[id].amount = self.rows[id].max; }
 							else { self.rows[id].amount = '0.00'; }
 						});
+						this.lookupExchangeRate({ force: false });
 					},
 					onCheck: function(id) {
 						var r = this.rows[id];
 						if (r.checked && parseFloat(r.amount) === 0) { r.amount = r.max; }
 						if (!r.checked) { r.amount = '0.00'; }
+						this.lookupExchangeRate({ force: false });
 					},
 					onAmountInput: function(id) {
 						var r = this.rows[id];
 						r.checked = (parseFloat(r.amount) || 0) > 0;
+						this.lookupExchangeRate({ force: false });
 					},
 					selectedCount: function() {
 						var self = this;
@@ -421,6 +442,83 @@ templ bodyPayBills(vm PayBillsVM) {
 						var c = this.detectedBillCurrency();
 						if (!c || c === this.baseCurrency) return '';
 						return '(1 ' + c + ' = ? ' + this.baseCurrency + ')';
+					},
+					onPaymentDateChange: function() {
+						this.exchangeRateManual = false;
+						this.lookupExchangeRate({ force: true });
+					},
+					onExchangeRateInput: function() {
+						this.exchangeRateManual = String(this.exchangeRate || '').trim() !== '';
+						if (!this.exchangeRateManual) {
+							this.lookupExchangeRate({ force: true });
+						} else {
+							this.exchangeRateHint = '';
+						}
+					},
+					lookupExchangeRate: async function(options) {
+						var opts = options || {};
+						var currency = this.detectedBillCurrency();
+						if (!currency || currency === this.baseCurrency || this.mixedCurrencies()) {
+							this.exchangeRateHint = '';
+							return;
+						}
+						if (this.exchangeRateManual && !opts.force) return;
+						var date = this._paymentDateValue();
+						if (!this._isDateReady(date)) {
+							this.exchangeRateFetchSeq++;
+							this.exchangeRateHint = String(this.exchangeRate || '').trim() === '' ? 'Select a payment date to load its exchange rate.' : '';
+							return;
+						}
+						var seq = ++this.exchangeRateFetchSeq;
+						var params = new URLSearchParams({
+							transaction_currency_code: currency,
+							date: date,
+							allow_provider_fetch: '1',
+						});
+						this.exchangeRateHint = 'Looking up rate...';
+						try {
+							var fetchFn = window.balancizFetch || fetch;
+							var resp = await fetchFn('/api/exchange-rate?' + params.toString(), {
+								credentials: 'same-origin',
+								headers: { Accept: 'application/json' },
+							});
+							var data = await resp.json();
+							if (seq !== this.exchangeRateFetchSeq) return;
+							if (!resp.ok) {
+								this.exchangeRate = '';
+								this.exchangeRateHint = data && data.error ? data.error : 'No exchange rate found.';
+								return;
+							}
+							this.exchangeRate = String(data.exchange_rate || '');
+							var rateDate = data.exchange_rate_date ? ' for ' + data.exchange_rate_date : '';
+							var label = data.source_label || data.exchange_rate_source || 'rate table';
+							this.exchangeRateHint = 'Auto-filled from ' + label + rateDate + '.';
+						} catch (_) {
+							if (seq !== this.exchangeRateFetchSeq) return;
+							this.exchangeRate = '';
+							this.exchangeRateHint = 'Could not look up exchange rate.';
+						}
+					},
+					_paymentDateValue: function() {
+						if (!this.$el || !this.$el.querySelector) return '';
+						var field = this.$el.querySelector('[name="entry_date"]');
+						if (!field) return '';
+						var valueAsDate = field.valueAsDate;
+						if (String(field.type || '').toLowerCase() === 'date' && valueAsDate && typeof valueAsDate.getTime === 'function' && !isNaN(valueAsDate.getTime())) {
+							return [
+								String(valueAsDate.getUTCFullYear()).padStart(4, '0'),
+								String(valueAsDate.getUTCMonth() + 1).padStart(2, '0'),
+								String(valueAsDate.getUTCDate()).padStart(2, '0'),
+							].join('-');
+						}
+						return String(field.value || '').trim();
+					},
+					_isDateReady: function(value) {
+						return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
+					},
+					_exchangeRateField: function() {
+						if (!this.$el || !this.$el.querySelector) return null;
+						return this.$el.querySelector('[name="exchange_rate"]');
 					},
 
 					// ── Pagination ─────────────────────────────────────────────────
